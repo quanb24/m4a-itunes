@@ -13,51 +13,114 @@
       - leftover .part files from an interrupted run
       - songs that appear more than once in -Destination (same artist + album + disc + track + title)
 
+    Empty, damaged or unreadable files are reported as problems instead of stopping the run.
+    Source and Destination must both exist and must not be the same folder or inside
+    each other.
+
     Results are printed and saved to verify-report.csv in -Destination.
-    Nothing is modified.
+    Nothing else is written, and the MP3 and M4A files are never modified.
 
 .EXAMPLE
     .\Verify-M4aLibrary.ps1 -Source "D:\Music\MP3" -Destination "D:\Music\M4A"
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Source,
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Source,
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Destination
 )
 
-if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-    Write-Error 'ffprobe was not found on PATH. It ships with FFmpeg; see README.'
+function Stop-WithError([string]$Message) {
+    Write-Error $Message
     exit 1
 }
 
-$srcRoot = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Source).ProviderPath).TrimEnd('\', '/')
-$dstRoot = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Destination).ProviderPath).TrimEnd('\', '/')
+# Absolute, normalized folder path (relative paths resolve against the current PowerShell
+# location). Only a drive root keeps its trailing separator.
+function Get-NormalizedPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+    if ($full.Length -gt [System.IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\', '/') }
+    $full
+}
+
+# True if $Child is $Parent or anywhere below it. Case-insensitive, to be safe on Windows/macOS.
+function Test-IsSameOrInside([string]$Child, [string]$Parent) {
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    ($Child.TrimEnd('\', '/') + $sep).StartsWith($Parent.TrimEnd('\', '/') + $sep, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    Stop-WithError 'ffprobe was not found on PATH. It ships with FFmpeg; see README.'
+}
+
+if ([string]::IsNullOrWhiteSpace($Source) -or [string]::IsNullOrWhiteSpace($Destination)) {
+    Stop-WithError 'Source and Destination must not be blank.'
+}
+try {
+    $srcRoot = Get-NormalizedPath $Source
+    $dstRoot = Get-NormalizedPath $Destination
+} catch {
+    Stop-WithError "Invalid folder path: $($_.Exception.Message)"
+}
+if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) {
+    Stop-WithError "Source folder not found (or is not a folder): $srcRoot"
+}
+if (-not (Test-Path -LiteralPath $dstRoot -PathType Container)) {
+    Stop-WithError "Destination folder not found (or is not a folder): $dstRoot"
+}
+if (Test-IsSameOrInside $dstRoot $srcRoot) {
+    Stop-WithError "Destination must not be the Source folder or inside it. Source: $srcRoot  Destination: $dstRoot"
+}
+if (Test-IsSameOrInside $srcRoot $dstRoot) {
+    Stop-WithError "Source must not be inside the Destination folder. Source: $srcRoot  Destination: $dstRoot"
+}
 
 $tagKeys = 'title', 'artist', 'album', 'album_artist', 'track', 'disc', 'genre', 'date'
 
+# Reads a file with ffprobe. Returns an object whose Error is set if the file can't be read.
 function Get-MediaInfo([string]$path) {
-    $json = & ffprobe -v error -print_format json -show_format -show_streams $path 2>$null | Out-String
-    if (-not $json.Trim()) { return $null }
-    $data = $json | ConvertFrom-Json
+    $unreadable = { param($why) [pscustomobject]@{ Error = $why; Tags = @{}; AudioCodec = $null; Duration = 0.0; HasArt = $false } }
+
+    $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    if (-not $item) { return (& $unreadable 'file could not be opened') }
+    if ($item.Length -eq 0) { return (& $unreadable 'file is empty (0 bytes)') }
+
+    $stderr = New-Object System.Collections.Generic.List[string]
+    $json = & ffprobe -v error -print_format json -show_format -show_streams $path 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $stderr.Add("$_".Trim()) } else { "$_" }
+    } | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not $json.Trim()) {
+        return (& $unreadable ("ffprobe could not read it: " + (($stderr | Where-Object { $_ }) -join ' | ')))
+    }
+    try {
+        $data = $json | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return (& $unreadable "ffprobe returned unreadable output: $($_.Exception.Message)")
+    }
 
     $tags = @{}
-    if ($data.format.tags) {
+    if ($data.format -and $data.format.tags) {
         foreach ($p in $data.format.tags.PSObject.Properties) { $tags[$p.Name.ToLowerInvariant()] = "$($p.Value)".Trim() }
     }
     $audio = @($data.streams | Where-Object { $_.codec_type -eq 'audio' }) | Select-Object -First 1
     $art = @($data.streams | Where-Object { $_.codec_type -eq 'video' -and $_.disposition.attached_pic -eq 1 })
+    $duration = 0.0
+    if ($data.format) {
+        [void][double]::TryParse("$($data.format.duration)", [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration)
+    }
 
     [pscustomobject]@{
+        Error      = $null
         Tags       = $tags
         AudioCodec = if ($audio) { $audio.codec_name } else { $null }
-        Duration   = [double]$data.format.duration
+        Duration   = $duration
         HasArt     = $art.Count -gt 0
     }
 }
 
 $dupIndex = @{}
 function Add-DupEntry($info, [string]$path) {
-    if (-not $info -or -not $info.Tags['title']) { return }
+    if (-not $info -or $info.Error -or -not $info.Tags['title']) { return }
     $key = ('artist', 'album', 'disc', 'track', 'title' |
             ForEach-Object { "$($info.Tags[$_])".ToLowerInvariant() }) -join '|'
     if (-not $dupIndex.ContainsKey($key)) { $dupIndex[$key] = New-Object System.Collections.Generic.List[string] }
@@ -68,9 +131,12 @@ function Get-RelativeKey([string]$root, [string]$full) {
     [System.IO.Path]::ChangeExtension($full.Substring($root.Length).TrimStart('\', '/'), $null).TrimEnd('.').ToLowerInvariant()
 }
 
-$mp3s = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File | Where-Object { $_.Extension -eq '.mp3' })
-$m4as = @(Get-ChildItem -LiteralPath $dstRoot -Recurse -File | Where-Object { $_.Extension -eq '.m4a' })
-$parts = @(Get-ChildItem -LiteralPath $dstRoot -Recurse -File | Where-Object { $_.Name -like '*.m4a.part' })
+$mp3s = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File -ErrorAction SilentlyContinue -ErrorVariable listErrors |
+    Where-Object { $_.Extension -eq '.mp3' })
+$dstFiles = @(Get-ChildItem -LiteralPath $dstRoot -Recurse -File -ErrorAction SilentlyContinue -ErrorVariable +listErrors)
+foreach ($e in $listErrors) { Write-Warning "Could not read part of a folder: $($e.Exception.Message)" }
+$m4as = @($dstFiles | Where-Object { $_.Extension -eq '.m4a' })
+$parts = @($dstFiles | Where-Object { $_.Name -like '*.m4a.part' })
 
 $m4aByKey = @{}
 foreach ($f in $m4as) { $m4aByKey[(Get-RelativeKey $dstRoot $f.FullName)] = $f }
@@ -92,14 +158,16 @@ foreach ($mp3 in $mp3s) {
     } else {
         $src = Get-MediaInfo $mp3.FullName
         $dst = Get-MediaInfo $m4a.FullName
-        if (-not $dst) {
-            $problems.Add('M4A unreadable')
+        if ($dst.Error) {
+            $problems.Add("M4A unreadable: $($dst.Error)")
         } else {
             if ($dst.AudioCodec -notin 'aac', 'alac') { $problems.Add("audio codec is '$($dst.AudioCodec)'") }
-            if ($src -and [math]::Abs($src.Duration - $dst.Duration) -gt 1.0) {
-                $problems.Add(('duration {0:N1}s vs MP3 {1:N1}s' -f $dst.Duration, $src.Duration))
-            }
-            if ($src) {
+            if ($src.Error) {
+                $problems.Add("MP3 unreadable, could not compare: $($src.Error)")
+            } else {
+                if ($src.Duration -gt 0 -and [math]::Abs($src.Duration - $dst.Duration) -gt 1.0) {
+                    $problems.Add(('duration {0:N1}s vs MP3 {1:N1}s' -f $dst.Duration, $src.Duration))
+                }
                 foreach ($k in $tagKeys) {
                     $a = $src.Tags[$k]; $b = $dst.Tags[$k]
                     if ($a -and $a -ne $b) { $problems.Add("$k differs ('$a' -> '$b')") }
@@ -134,7 +202,11 @@ foreach ($entry in $dupIndex.GetEnumerator()) {
 }
 
 $csv = Join-Path $dstRoot 'verify-report.csv'
-$report | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+try {
+    $report | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+} catch {
+    Write-Warning "Could not write $csv : $($_.Exception.Message)"
+}
 
 $ok = @($report | Where-Object Status -eq 'OK').Count
 $bad = @($report | Where-Object Status -ne 'OK')
