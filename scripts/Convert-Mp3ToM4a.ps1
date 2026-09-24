@@ -219,6 +219,14 @@ foreach ($file in $files) {
     $outDir = Split-Path -Parent $outFile
     $partFile = "$outFile.part"
 
+    # A folder with the output's name would make the final rename move the file into it.
+    if (Test-Path -LiteralPath $outFile -PathType Container) {
+        $msg = "$rel :: a folder named like the output already exists: $outFile"
+        $failed.Add($msg)
+        Write-Warning "FAILED: $msg"
+        continue
+    }
+
     if ((Test-Path -LiteralPath $outFile -PathType Leaf) -and -not $Overwrite) {
         $skipped++
         Write-Host "[$i/$($files.Count)] skip (exists)  $rel"
