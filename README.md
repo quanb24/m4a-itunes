@@ -179,13 +179,27 @@ What it does:
 - Finds every `.mp3` in `D:\Music\MP3` and all subfolders.
 - Writes `D:\Music\M4A\<same subfolders>\<same name>.m4a`.
 - Never modifies or deletes your MP3s.
+- **Refuses to start** if the destination is the same folder as the source, is inside it
+  (e.g. `D:\Music\MP3\M4A`) or contains it (e.g. `D:\Music`), if the source folder doesn't
+  exist, if the destination is an existing file, or if `-Bitrate` is invalid. Nothing is
+  created in that case.
 - **Skips files that already exist**, so running it again after an interruption continues
   where it left off without duplicating anything (`-Overwrite` forces re-conversion).
-- Writes to `*.m4a.part` first and renames on success, so there are no half-written files.
+- Checks each MP3 with `ffprobe` first. Empty, damaged or non-audio files (e.g. a renamed
+  image) are logged as failures and skipped; the rest of the library carries on.
+- Writes to `*.m4a.part` first. Only after `ffprobe` confirms the `.part` file is readable
+  from start to end and contains one AAC (or ALAC) audio stream is it renamed to `.m4a`.
+  If FFmpeg fails, the check fails, or you press **Ctrl+C**, the `.part` file is deleted and
+  any existing `.m4a` is left as it was, so there are no half-written files.
 - Converts non-JPEG/PNG artwork to JPEG.
+- If FFmpeg converts a file but reports decoding problems in the MP3 (common with damaged
+  or truncated MP3s), it prints a warning so you can listen to that song.
 - Lists failures and writes them to `D:\Music\M4A\conversion-errors.log`.
+- Exit code: `0` = everything converted or skipped, `1` = bad parameters or FFmpeg missing,
+  `2` = some files failed (see the log).
 
-ALAC instead of AAC: add `-Codec alac`. Different bitrate: `-Bitrate 320k`.
+ALAC instead of AAC: add `-Codec alac`. Different bitrate: `-Bitrate 320k`
+(allowed: `64k` to `320k`, written as `256k` or `256000`; `-Bitrate` is ignored for ALAC).
 
 ### 7b. Inline PowerShell (no script file)
 Paste into PowerShell. Edit the two paths first; the source path must not end with `\`.
@@ -205,8 +219,12 @@ powershell -ExecutionPolicy Bypass -File C:\m4a-itunes\scripts\Verify-M4aLibrary
 ```
 For each MP3 it checks that the M4A exists, is AAC/ALAC, has the same duration, has the
 same title/artist/album/album artist/track/disc/genre/date, and has artwork if the MP3 had
-it. It also flags extra M4As, leftover `.part` files and duplicate songs. The report is saved as
-`verify-report.csv` in the destination folder.
+it. It also flags extra M4As, leftover `.part` files and duplicate songs. Empty or unreadable
+M4A/MP3 files are reported as problems instead of stopping the check. Both folders must
+exist, and the same folder rules as the converter apply. The report is saved as
+`verify-report.csv` in the destination folder (the only file it writes). A truncated MP3
+shows up here as a duration mismatch, since its M4A is only as long as the audio that could
+be decoded.
 
 **Try it on one album first**, check it on your iPhone, then run the whole library.
 
@@ -302,6 +320,9 @@ PC and iPhone instead. Your M4As upload to iCloud and appear on the phone over t
 | `codec not currently supported in container` | You used `-c:a copy` (MP3 audio can't go in an iTunes M4A) or mapped extra streams. Use the exact commands above |
 | `Invalid data found when processing input` / `Failed to find two consecutive MPEG audio frames` | The file is damaged or isn't really an MP3 (e.g. a renamed WMA/WAV). Check with `ffprobe "file.mp3"`; replace the file or convert from what it really is |
 | `File '…m4a' already exists. Exiting.` | Expected when re-running with `-n`: it's protecting existing output |
+| Script: `Destination must not be the Source folder or inside it` / `Source must not be inside the Destination folder` | Pick a destination next to the MP3 folder, e.g. `D:\Music\MP3` → `D:\Music\M4A` |
+| Script: `MP3 is empty (0 bytes)` / `MP3 is damaged or not an audio file` / `MP3 contains no audio stream` | That file can't be converted. Replace it from a backup or re-download it; the other files are unaffected |
+| Script: `output check failed: …` | FFmpeg finished but the new file didn't pass the check (unreadable, cut short, or wrong codec), so it was discarded. Check free disk space and antivirus/cloud-sync tools locking the folder, then re-run |
 | Artwork causes an error with a file that has several pictures | The commands take only the first picture (`0:v:0`). Clean up extra images in Mp3tag if the first isn't the front cover |
 
 ### Duplicate library entries
